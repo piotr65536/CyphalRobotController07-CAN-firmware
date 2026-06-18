@@ -1020,6 +1020,13 @@ bool TimerHandler0(struct repeating_timer *t)
   static int motor1_error_sum = 0;
   static int motor1_pwm_old   = 0;
 
+  /* Anti-windup bound for the integrator. The I-term is error_sum/30, so capping
+     error_sum at 30*255 caps the integral contribution at +/-255 (full PWM) and,
+     crucially, lets it unwind in one step when the command changes. Without this
+     the integral runs away and over-drives it, and it only clears on a value==0
+     command. */
+  static const int MOTOR_ERROR_SUM_MAX = 30 * 255;
+
 /* PID controller for motor 0 */
   int encoder0_new = encoder0.getCount();
   int encoder0_diff = encoder0_new - encoder0_old;
@@ -1030,6 +1037,9 @@ bool TimerHandler0(struct repeating_timer *t)
   {
     int motor0_error = motor0_ticks_per_100ms - encoder0_diff;
     motor0_error_sum = motor0_error_sum + motor0_error;
+    /* anti-windup: bound the integrator (see MOTOR_ERROR_SUM_MAX above) */
+    if (motor0_error_sum >  MOTOR_ERROR_SUM_MAX) motor0_error_sum =  MOTOR_ERROR_SUM_MAX;
+    if (motor0_error_sum < -MOTOR_ERROR_SUM_MAX) motor0_error_sum = -MOTOR_ERROR_SUM_MAX;
     int motor0_real_pwm = ( motor0_error / 10 ) + ( motor0_error_sum / 30 );
 //    int motor0_real_pwm = ( motor0_error / 10 ) + ( motor0_error_sum / 10 ) + ( motor0_error - motor0_error_old );
     motor0_error_old = motor0_error;
@@ -1063,6 +1073,9 @@ bool TimerHandler0(struct repeating_timer *t)
   {
     int motor1_error = motor1_ticks_per_100ms - encoder1_diff;
     motor1_error_sum = motor1_error_sum + motor1_error;
+    /* anti-windup: bound the integrator (see MOTOR_ERROR_SUM_MAX above) */
+    if (motor1_error_sum >  MOTOR_ERROR_SUM_MAX) motor1_error_sum =  MOTOR_ERROR_SUM_MAX;
+    if (motor1_error_sum < -MOTOR_ERROR_SUM_MAX) motor1_error_sum = -MOTOR_ERROR_SUM_MAX;
     int motor1_real_pwm = ( motor1_error / 10 ) + ( motor1_error_sum / 30 );
 //    int motor1_real_pwm = ( motor1_error / 10 ) + ( motor1_error_sum / 10 ) + ( motor1_error - motor1_error_old );
     motor1_error_old = motor1_error;
