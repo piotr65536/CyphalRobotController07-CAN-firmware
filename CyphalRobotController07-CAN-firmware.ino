@@ -90,13 +90,13 @@ static float const MOTOR_RPM_TO_TICKS_DIV = 60.0f * 1000.0f / (float)TIMER0_INTE
 
 /* Encoder CPR (counts per revolution) * gearbox ratio.
    Overridable at runtime via the crc07.motor_N.counts_per_rotation registers. */
-static uint16_t const MOTOR_DEFAULT_COUNTS_PER_ROTATION = 44*506;
+static uint16_t const MOTOR_DEFAULT_COUNTS_PER_ROTATION = 48*30;
 
 /* PID factors (0.0 - 1.0):
      pwm = MOTOR_KF * setpoint + MOTOR_KP * error + MOTOR_KI * error_sum
    Re-tune when counts_per_rotation changes. */
-static float const MOTOR_KP = 0.1f;
-static float const MOTOR_KI = 0.0333333f;
+static float const MOTOR_KP = 1.5f;
+static float const MOTOR_KI = 0.5f;
 
 /* Anti-windup: caps the integral term at +/-MOTOR_PWM_MAX. */
 static int const MOTOR_ERROR_SUM_MAX = (int)((float)MOTOR_PWM_MAX / MOTOR_KI);
