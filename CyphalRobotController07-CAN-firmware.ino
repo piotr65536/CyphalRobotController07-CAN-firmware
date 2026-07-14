@@ -79,7 +79,31 @@ static uint32_t const WATCHDOG_DELAY_ms = 1000;
 
 #define TIMER0_INTERVAL_MS 100
 
-static int const MOTOR_PWM_MAX_DIFF = 40;
+/* Full-scale PWM. Must match the clamp in Ifx007t::pwm(). */
+static int const MOTOR_PWM_MAX = 255;
+
+/* Max PWM change per cycle. Lower if the motors jerk or spike current. */
+static int const MOTOR_PWM_MAX_DIFF = 120;
+
+/* RPM -> encoder ticks per cycle: ticks = RPM * counts_per_rotation / MOTOR_RPM_TO_TICKS_DIV */
+static float const MOTOR_RPM_TO_TICKS_DIV = 60.0f * 1000.0f / (float)TIMER0_INTERVAL_MS;
+
+/* Encoder CPR (counts per revolution) * gearbox ratio.
+   Overridable at runtime via the crc07.motor_N.counts_per_rotation registers. */
+static uint16_t const MOTOR_DEFAULT_COUNTS_PER_ROTATION = 44*506;
+
+/* PID factors (0.0 - 1.0):
+     pwm = MOTOR_KF * setpoint + MOTOR_KP * error + MOTOR_KI * error_sum
+   Re-tune when counts_per_rotation changes. */
+static float const MOTOR_KP = 0.1f;
+static float const MOTOR_KI = 0.0333333f;
+
+/* Anti-windup: caps the integral term at +/-MOTOR_PWM_MAX. */
+static int const MOTOR_ERROR_SUM_MAX = (int)((float)MOTOR_PWM_MAX / MOTOR_KI);
+
+/* Velocity feedforward: supplies the PWM for the setpoint so the integrator stays near
+   zero. 0 disables it. */
+static float const MOTOR_KF = 0.0f;
 
 /**************************************************************************************
  * FUNCTION DECLARATION
@@ -107,6 +131,10 @@ RPI_PICO_Timer ITimer0(0);
 
 static int motor0_ticks_per_100ms = 0;
 static int motor1_ticks_per_100ms = 0;
+static volatile int g_motor0_error = 0;    // PID debug (from timer ISR): motor0 error = setpoint - measured
+static volatile int g_motor1_error = 0;    // motor1 error
+static volatile int g_encoder0_diff = 0;   // motor0 measured speed (encoder ticks / 100ms)
+static volatile int g_encoder1_diff = 0;   // motor1 measured speed
 static bool motor0_enabled_flag = 0;
 static bool motor1_enabled_flag = 0;
 static bool motor0_controller_enabled_flag = 0;
@@ -144,6 +172,10 @@ cyphal::Publisher<uavcan::primitive::scalar::Integer16_1_0> motor0_bemf_pub;
 cyphal::Publisher<uavcan::primitive::scalar::Integer16_1_0> motor1_bemf_pub;
 cyphal::Publisher<uavcan::primitive::scalar::Integer32_1_0> encoder0_pub;
 cyphal::Publisher<uavcan::primitive::scalar::Integer32_1_0> encoder1_pub;
+cyphal::Publisher<uavcan::primitive::scalar::Integer32_1_0> motor0_debug_pub;   // motor0 error (setpoint - measured)
+cyphal::Publisher<uavcan::primitive::scalar::Integer32_1_0> motor1_debug_pub;   // motor1 error
+cyphal::Publisher<uavcan::primitive::scalar::Integer32_1_0> encoder0_diff_pub;  // motor0 measured speed (ticks/100ms)
+cyphal::Publisher<uavcan::primitive::scalar::Integer32_1_0> encoder1_diff_pub;  // motor1 measured speed
 
 cyphal::Subscription output_0_subscription, output_1_subscription;
 cyphal::Subscription motor_0_subscription, motor_1_subscription;
@@ -226,6 +258,10 @@ static CanardPortID port_id_motor0_bemf          = std::numeric_limits<CanardPor
 static CanardPortID port_id_motor1_bemf          = std::numeric_limits<CanardPortID>::max();
 static CanardPortID port_id_encoder0             = std::numeric_limits<CanardPortID>::max();
 static CanardPortID port_id_encoder1             = std::numeric_limits<CanardPortID>::max();
+static CanardPortID const port_id_motor0_debug   = 1010;   // motor0 error           (yakut sub 1010)
+static CanardPortID const port_id_motor1_debug   = 1011;   // motor1 error           (yakut sub 1011)
+static CanardPortID const port_id_encoder0_diff  = 1012;   // motor0 measured speed  (yakut sub 1012)
+static CanardPortID const port_id_encoder1_diff  = 1013;   // motor1 measured speed  (yakut sub 1013)
 static CanardPortID port_id_light_mode           = std::numeric_limits<CanardPortID>::max();
 
 static uint16_t update_period_ms_internaltemperature = 10*1000;
@@ -250,8 +286,8 @@ static bool reverse_motor_0                          = false;
 static bool reverse_motor_1                          = false;
 static unsigned long prev_motor0_update              = 0;
 static unsigned long prev_motor1_update              = 0;
-static uint16_t motor0_counts_per_rotation           = 4*11*506;
-static uint16_t motor1_counts_per_rotation           = 4*11*506;
+static uint16_t motor0_counts_per_rotation           = MOTOR_DEFAULT_COUNTS_PER_ROTATION; // per output rotation (encoder_impulses_per_shaft_rotation*gearbox_ratio)
+static uint16_t motor1_counts_per_rotation           = MOTOR_DEFAULT_COUNTS_PER_ROTATION; // per output rotation (encoder_impulses_per_shaft_rotation*gearbox_ratio)
 
 static std::string node_description{"CyphalRobotController07/CAN"};
 
@@ -448,11 +484,11 @@ void setup()
         {
           if (reverse_motor_0)
           {
-            motor0_ticks_per_100ms = (int)(-1.0 * msg.value * motor0_counts_per_rotation / (float)600.0);
+            motor0_ticks_per_100ms = (int)(-1.0 * msg.value * motor0_counts_per_rotation / MOTOR_RPM_TO_TICKS_DIV);
           }
           else
           {
-            motor0_ticks_per_100ms = (int)(msg.value * motor0_counts_per_rotation / (float)600.0);
+            motor0_ticks_per_100ms = (int)(msg.value * motor0_counts_per_rotation / MOTOR_RPM_TO_TICKS_DIV);
           }
           prev_motor0_update = millis();
           motor0_enabled_flag = 1;
@@ -474,11 +510,11 @@ void setup()
         {
           if (reverse_motor_1)
           {
-            motor1_ticks_per_100ms = (int)(-1.0 * msg.value * motor1_counts_per_rotation / (float)600.0);
+            motor1_ticks_per_100ms = (int)(-1.0 * msg.value * motor1_counts_per_rotation / MOTOR_RPM_TO_TICKS_DIV);
           }
           else
           {
-            motor1_ticks_per_100ms = (int)(msg.value * motor1_counts_per_rotation / (float)600.0);
+            motor1_ticks_per_100ms = (int)(msg.value * motor1_counts_per_rotation / MOTOR_RPM_TO_TICKS_DIV);
           }
           prev_motor1_update = millis();
           motor1_enabled_flag = 1;
@@ -532,6 +568,10 @@ void setup()
     encoder0_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer32_1_0>(port_id_encoder0, 1*1000*1000UL /* = 1 sec in usecs. */);
   if (port_id_encoder1 != std::numeric_limits<CanardPortID>::max())
     encoder1_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer32_1_0>(port_id_encoder1, 1*1000*1000UL /* = 1 sec in usecs. */);
+  motor0_debug_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer32_1_0>(port_id_motor0_debug, 1*1000*1000UL /* = 1 sec in usecs. */);
+  motor1_debug_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer32_1_0>(port_id_motor1_debug, 1*1000*1000UL /* = 1 sec in usecs. */);
+  encoder0_diff_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer32_1_0>(port_id_encoder0_diff, 1*1000*1000UL /* = 1 sec in usecs. */);
+  encoder1_diff_pub = node_hdl.create_publisher<uavcan::primitive::scalar::Integer32_1_0>(port_id_encoder1_diff, 1*1000*1000UL /* = 1 sec in usecs. */);
   /* set factory settings */
   if(update_period_ms_internaltemperature==0xFFFF) update_period_ms_internaltemperature=10*1000;
   if(update_period_ms_input_voltage==0xFFFF)       update_period_ms_input_voltage=1*1000;
@@ -896,6 +936,19 @@ void loop()
 
     prev_motor1_bemf = now;
   }
+  static unsigned long prev_motor_debug = 0;
+  if((now - prev_motor_debug) > 50)   /* PID debug @ 20 Hz: err on 1010/1011, measured speed (encoder diff) on 1012/1013 */
+  {
+    uavcan::primitive::scalar::Integer32_1_0 dbg0; dbg0.value = g_motor0_error;
+    if(motor0_debug_pub) motor0_debug_pub->publish(dbg0);
+    uavcan::primitive::scalar::Integer32_1_0 dbg1; dbg1.value = g_motor1_error;
+    if(motor1_debug_pub) motor1_debug_pub->publish(dbg1);
+    uavcan::primitive::scalar::Integer32_1_0 enc0; enc0.value = g_encoder0_diff;
+    if(encoder0_diff_pub) encoder0_diff_pub->publish(enc0);
+    uavcan::primitive::scalar::Integer32_1_0 enc1; enc1.value = g_encoder1_diff;
+    if(encoder1_diff_pub) encoder1_diff_pub->publish(enc1);
+    prev_motor_debug = now;
+  }
   if((now - prev_encoder0) > update_period_ms_encoder0)
   {
     uavcan::primitive::scalar::Integer32_1_0 uavcan_encoder0;
@@ -1019,28 +1072,31 @@ bool TimerHandler0(struct repeating_timer *t)
   static int motor1_error_old = 0;
   static int motor1_error_sum = 0;
   static int motor1_pwm_old   = 0;
-
-  /* Anti-windup bound for the integrator. The I-term is error_sum/30, so capping
-     error_sum at 30*255 caps the integral contribution at +/-255 (full PWM) and,
-     crucially, lets it unwind in one step when the command changes. Without this
-     the integral runs away and over-drives it, and it only clears on a value==0
-     command. */
-  static const int MOTOR_ERROR_SUM_MAX = 30 * 255;
+  static int motor0_ticks_old = 0;   // previous commanded setpoint (to detect setpoint changes)
+  static int motor1_ticks_old = 0;
 
 /* PID controller for motor 0 */
   int encoder0_new = encoder0.getCount();
   int encoder0_diff = encoder0_new - encoder0_old;
   encoder0_diff = 0 - encoder0_diff; // invert encoder diff
   encoder0_old = encoder0_new;
+  g_encoder0_diff = encoder0_diff;   // measured speed for CAN debug (always, even when disabled)
 
   if ( ( motor0_enabled_flag == 1 ) && ( motor0_controller_enabled_flag == 1 ) )
   {
     int motor0_error = motor0_ticks_per_100ms - encoder0_diff;
+
+    /* On a setpoint magnitude decrease, scale the integrator toward the new operating
+       point so a lower command takes effect promptly (clamping alone unwinds slowly). */
+    if (motor0_ticks_old != 0 && abs(motor0_ticks_per_100ms) < abs(motor0_ticks_old))
+      motor0_error_sum = (long)motor0_error_sum * abs(motor0_ticks_per_100ms) / abs(motor0_ticks_old);
+    motor0_ticks_old = motor0_ticks_per_100ms;
+
     motor0_error_sum = motor0_error_sum + motor0_error;
     /* anti-windup: bound the integrator (see MOTOR_ERROR_SUM_MAX above) */
     if (motor0_error_sum >  MOTOR_ERROR_SUM_MAX) motor0_error_sum =  MOTOR_ERROR_SUM_MAX;
     if (motor0_error_sum < -MOTOR_ERROR_SUM_MAX) motor0_error_sum = -MOTOR_ERROR_SUM_MAX;
-    int motor0_real_pwm = ( motor0_error / 10 ) + ( motor0_error_sum / 30 );
+    int motor0_real_pwm = (int)( MOTOR_KF * motor0_ticks_per_100ms + MOTOR_KP * motor0_error + MOTOR_KI * motor0_error_sum );
 //    int motor0_real_pwm = ( motor0_error / 10 ) + ( motor0_error_sum / 10 ) + ( motor0_error - motor0_error_old );
     motor0_error_old = motor0_error;
 
@@ -1048,19 +1104,22 @@ bool TimerHandler0(struct repeating_timer *t)
     if (( motor0_real_pwm - motor0_pwm_old ) > MOTOR_PWM_MAX_DIFF )  motor0_real_pwm = motor0_pwm_old + MOTOR_PWM_MAX_DIFF;
     if (( motor0_real_pwm - motor0_pwm_old ) < -MOTOR_PWM_MAX_DIFF ) motor0_real_pwm = motor0_pwm_old - MOTOR_PWM_MAX_DIFF;
 
-    if ( motor0_real_pwm > 255 ) motor0_error_sum = motor0_error_sum - motor0_error;
-    if ( motor0_real_pwm < -255 ) motor0_error_sum = motor0_error_sum - motor0_error;
+    if ( motor0_real_pwm >  MOTOR_PWM_MAX ) motor0_error_sum = motor0_error_sum - motor0_error;
+    if ( motor0_real_pwm < -MOTOR_PWM_MAX ) motor0_error_sum = motor0_error_sum - motor0_error;
 
     mot0.pwm(motor0_real_pwm);
     motor0_pwm_old=motor0_real_pwm;
+    g_motor0_error = motor0_error;   // expose to loop() for CAN debug
 
-//    DBG_INFO("M0 %d|%d|%d|%d", motor0_ticks_per_100ms, encoder0_diff, motor0_error, motor0_real_pwm);
+//    DBG_INFO("M0 sp %d enc %d err %d isum %d pwm %d", motor0_ticks_per_100ms, encoder0_diff, motor0_error, motor0_error_sum, motor0_real_pwm);  // NEVER enable on the robot: Serial in the timer ISR hangs it -> CAN dies
   }
   else
   {
     motor0_error_old = 0;
     motor0_error_sum = 0;
     motor0_pwm_old   = 0;
+    motor0_ticks_old = 0;
+    g_motor0_error = 0;
   }
 
 /* PID controller for motor 1 */
@@ -1068,15 +1127,23 @@ bool TimerHandler0(struct repeating_timer *t)
   int encoder1_diff = encoder1_new - encoder1_old;
   encoder1_diff = 0 - encoder1_diff; // invert encoder diff
   encoder1_old = encoder1_new;
+  g_encoder1_diff = encoder1_diff;   // measured speed for CAN debug (always, even when disabled)
 
   if ( ( motor1_enabled_flag == 1 ) && ( motor1_controller_enabled_flag == 1 ) )
   {
     int motor1_error = motor1_ticks_per_100ms - encoder1_diff;
+
+    /* On a setpoint magnitude decrease, scale the integrator toward the new operating
+       point so a lower command takes effect promptly (clamping alone unwinds slowly). */
+    if (motor1_ticks_old != 0 && abs(motor1_ticks_per_100ms) < abs(motor1_ticks_old))
+      motor1_error_sum = (long)motor1_error_sum * abs(motor1_ticks_per_100ms) / abs(motor1_ticks_old);
+    motor1_ticks_old = motor1_ticks_per_100ms;
+
     motor1_error_sum = motor1_error_sum + motor1_error;
     /* anti-windup: bound the integrator (see MOTOR_ERROR_SUM_MAX above) */
     if (motor1_error_sum >  MOTOR_ERROR_SUM_MAX) motor1_error_sum =  MOTOR_ERROR_SUM_MAX;
     if (motor1_error_sum < -MOTOR_ERROR_SUM_MAX) motor1_error_sum = -MOTOR_ERROR_SUM_MAX;
-    int motor1_real_pwm = ( motor1_error / 10 ) + ( motor1_error_sum / 30 );
+    int motor1_real_pwm = (int)( MOTOR_KF * motor1_ticks_per_100ms + MOTOR_KP * motor1_error + MOTOR_KI * motor1_error_sum );
 //    int motor1_real_pwm = ( motor1_error / 10 ) + ( motor1_error_sum / 10 ) + ( motor1_error - motor1_error_old );
     motor1_error_old = motor1_error;
 
@@ -1084,19 +1151,22 @@ bool TimerHandler0(struct repeating_timer *t)
     if (( motor1_real_pwm - motor1_pwm_old ) > MOTOR_PWM_MAX_DIFF )  motor1_real_pwm = motor1_pwm_old + MOTOR_PWM_MAX_DIFF;
     if (( motor1_real_pwm - motor1_pwm_old ) < -MOTOR_PWM_MAX_DIFF ) motor1_real_pwm = motor1_pwm_old - MOTOR_PWM_MAX_DIFF;
 
-    if ( motor1_real_pwm > 255 ) motor1_error_sum = motor1_error_sum - motor1_error;
-    if ( motor1_real_pwm < -255 ) motor1_error_sum = motor1_error_sum - motor1_error;
+    if ( motor1_real_pwm >  MOTOR_PWM_MAX ) motor1_error_sum = motor1_error_sum - motor1_error;
+    if ( motor1_real_pwm < -MOTOR_PWM_MAX ) motor1_error_sum = motor1_error_sum - motor1_error;
 
     mot1.pwm(motor1_real_pwm);
     motor1_pwm_old=motor1_real_pwm;
+    g_motor1_error = motor1_error;   // expose to loop() for CAN debug
 
-//    DBG_INFO("M1 %d|%d|%d|%d", motor1_ticks_per_100ms, encoder1_diff, motor1_error, motor1_real_pwm);
+//    DBG_INFO("M1 sp %d enc %d err %d isum %d pwm %d", motor1_ticks_per_100ms, encoder1_diff, motor1_error, motor1_error_sum, motor1_real_pwm);  // NEVER enable on the robot: Serial in the timer ISR hangs it -> CAN dies
   }
   else
   {
     motor1_error_old = 0;
     motor1_error_sum = 0;
     motor1_pwm_old   = 0;
+    motor1_ticks_old = 0;
+    g_motor1_error = 0;
   }
 
   return true;
