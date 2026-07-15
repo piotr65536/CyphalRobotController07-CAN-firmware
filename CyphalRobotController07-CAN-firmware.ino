@@ -88,29 +88,28 @@ static float const MOTOR_RPM_TO_TICKS_WITHIN_INTERVAL = 60.0f * 1000.0f / (float
 /* Full-scale PWM. Must match the clamp in Ifx007t::pwm(). */
 static int const MOTOR_PWM_MAX = 255;
 
-/* ---------------- Constants dependent on the motor ---------------- */
+/* ------- Motor-dependent parameters (defaults). Runtime-settable via the crc07.*
+   CAN registers; persist with ExecuteCommand 65530. ------- */
 
 /* Max PWM change per cycle. Lower if the motors jerk or spike current. */
-static int const MOTOR_PWM_MAX_DIFF = 120;
+static uint16_t motor_pwm_max_diff = 120;
 
 /* Encoder CPR - counts per rotation (motor shaft) */
 static uint16_t const MOTOR_DEFAULT_COUNTS_PER_ROTATION = 48;
 
-/* PID factors (PWM counts per encoder tick). */
-static float const MOTOR_KP = 0.3f;
-static float const MOTOR_KI = 0.05f;
-
-/* Anti-windup: caps the integral term at +/-MOTOR_PWM_MAX. */
-static int const MOTOR_ERROR_SUM_MAX = (int)((float)MOTOR_PWM_MAX / MOTOR_KI);
+/* PID factors (PWM counts per encoder tick). The anti-windup cap is derived
+   from ki each cycle in TimerHandler0. */
+static float motor_kp = 0.3f;
+static float motor_ki = 0.05f;
 
 /* Velocity feedforward: supplies the PWM for the setpoint so the integrator stays
    near zero. Measured: 255 PWM -> ~545 ticks/interval, so ~0.45 PWM per tick. */
-static float const MOTOR_KF = 0.45f;
+static float motor_kf = 0.45f;
 
 /* Encoder polarity per motor. Wrong flag = positive feedback = motor runs away
    to full throttle. */
-static bool const ENCODER0_INVERT = true;
-static bool const ENCODER1_INVERT = true;
+static bool encoder0_invert = true;
+static bool encoder1_invert = true;
 
 /**************************************************************************************
  * FUNCTION DECLARATION
@@ -372,6 +371,12 @@ const auto reg_rw_crc07_reverse_motor0                       = node_registry->ex
 const auto reg_rw_crc07_reverse_motor1                       = node_registry->expose("crc07.motor_1.reverse",                      {true}, reverse_motor_1);
 const auto reg_rw_crc07_motor0_counts_per_rotation           = node_registry->expose("crc07.motor_0.counts_per_rotation",          {true}, motor0_counts_per_rotation);
 const auto reg_rw_crc07_motor1_counts_per_rotation           = node_registry->expose("crc07.motor_1.counts_per_rotation",          {true}, motor1_counts_per_rotation);
+const auto reg_rw_crc07_motor0_encoder_invert                = node_registry->expose("crc07.motor_0.encoder_invert",               {true}, encoder0_invert);
+const auto reg_rw_crc07_motor1_encoder_invert                = node_registry->expose("crc07.motor_1.encoder_invert",               {true}, encoder1_invert);
+const auto reg_rw_crc07_pid_kp                               = node_registry->expose("crc07.pid.kp",                               {true}, motor_kp);
+const auto reg_rw_crc07_pid_ki                               = node_registry->expose("crc07.pid.ki",                               {true}, motor_ki);
+const auto reg_rw_crc07_pid_kf                               = node_registry->expose("crc07.pid.kf",                               {true}, motor_kf);
+const auto reg_rw_crc07_pwm_max_diff                         = node_registry->expose("crc07.pwm_max_diff",                         {true}, motor_pwm_max_diff);
 
 #endif /* __GNUC__ >= 11 */
 
@@ -1082,10 +1087,13 @@ bool TimerHandler0(struct repeating_timer *t)
   static int motor0_ticks_old = 0;   // previous commanded setpoint (to detect setpoint changes)
   static int motor1_ticks_old = 0;
 
+  /* Anti-windup cap from the current ki: bounds the integral term at +/-MOTOR_PWM_MAX. */
+  int const motor_error_sum_max = (motor_ki > 0.0f) ? (int)((float)MOTOR_PWM_MAX / motor_ki) : (1 << 30);
+
 /* PID controller for motor 0 */
   int encoder0_new = encoder0.getCount();
   int encoder0_diff = encoder0_new - encoder0_old;
-  if (ENCODER0_INVERT) encoder0_diff = 0 - encoder0_diff;
+  if (encoder0_invert) encoder0_diff = 0 - encoder0_diff;
   encoder0_old = encoder0_new;
   g_encoder0_diff = encoder0_diff;   // measured speed for CAN debug (always, even when disabled)
 
@@ -1100,16 +1108,16 @@ bool TimerHandler0(struct repeating_timer *t)
     motor0_ticks_old = motor0_ticks_per_interval;
 
     motor0_error_sum = motor0_error_sum + motor0_error;
-    /* anti-windup: bound the integrator (see MOTOR_ERROR_SUM_MAX above) */
-    if (motor0_error_sum >  MOTOR_ERROR_SUM_MAX) motor0_error_sum =  MOTOR_ERROR_SUM_MAX;
-    if (motor0_error_sum < -MOTOR_ERROR_SUM_MAX) motor0_error_sum = -MOTOR_ERROR_SUM_MAX;
-    int motor0_real_pwm = (int)( MOTOR_KF * motor0_ticks_per_interval + MOTOR_KP * motor0_error + MOTOR_KI * motor0_error_sum );
+    /* anti-windup: bound the integrator (see motor_error_sum_max above) */
+    if (motor0_error_sum >  motor_error_sum_max) motor0_error_sum =  motor_error_sum_max;
+    if (motor0_error_sum < -motor_error_sum_max) motor0_error_sum = -motor_error_sum_max;
+    int motor0_real_pwm = (int)( motor_kf * motor0_ticks_per_interval + motor_kp * motor0_error + motor_ki * motor0_error_sum );
 //    int motor0_real_pwm = ( motor0_error / 10 ) + ( motor0_error_sum / 10 ) + ( motor0_error - motor0_error_old );
     motor0_error_old = motor0_error;
 
 /* limit max PWM change */
-    if (( motor0_real_pwm - motor0_pwm_old ) > MOTOR_PWM_MAX_DIFF )  motor0_real_pwm = motor0_pwm_old + MOTOR_PWM_MAX_DIFF;
-    if (( motor0_real_pwm - motor0_pwm_old ) < -MOTOR_PWM_MAX_DIFF ) motor0_real_pwm = motor0_pwm_old - MOTOR_PWM_MAX_DIFF;
+    if (( motor0_real_pwm - motor0_pwm_old ) > motor_pwm_max_diff )  motor0_real_pwm = motor0_pwm_old + motor_pwm_max_diff;
+    if (( motor0_real_pwm - motor0_pwm_old ) < -motor_pwm_max_diff ) motor0_real_pwm = motor0_pwm_old - motor_pwm_max_diff;
 
     if ( motor0_real_pwm >  MOTOR_PWM_MAX ) motor0_error_sum = motor0_error_sum - motor0_error;
     if ( motor0_real_pwm < -MOTOR_PWM_MAX ) motor0_error_sum = motor0_error_sum - motor0_error;
@@ -1132,7 +1140,7 @@ bool TimerHandler0(struct repeating_timer *t)
 /* PID controller for motor 1 */
   int encoder1_new = encoder1.getCount();
   int encoder1_diff = encoder1_new - encoder1_old;
-  if (ENCODER1_INVERT) encoder1_diff = 0 - encoder1_diff;
+  if (encoder1_invert) encoder1_diff = 0 - encoder1_diff;
   encoder1_old = encoder1_new;
   g_encoder1_diff = encoder1_diff;   // measured speed for CAN debug (always, even when disabled)
 
@@ -1147,16 +1155,16 @@ bool TimerHandler0(struct repeating_timer *t)
     motor1_ticks_old = motor1_ticks_per_interval;
 
     motor1_error_sum = motor1_error_sum + motor1_error;
-    /* anti-windup: bound the integrator (see MOTOR_ERROR_SUM_MAX above) */
-    if (motor1_error_sum >  MOTOR_ERROR_SUM_MAX) motor1_error_sum =  MOTOR_ERROR_SUM_MAX;
-    if (motor1_error_sum < -MOTOR_ERROR_SUM_MAX) motor1_error_sum = -MOTOR_ERROR_SUM_MAX;
-    int motor1_real_pwm = (int)( MOTOR_KF * motor1_ticks_per_interval + MOTOR_KP * motor1_error + MOTOR_KI * motor1_error_sum );
+    /* anti-windup: bound the integrator (see motor_error_sum_max above) */
+    if (motor1_error_sum >  motor_error_sum_max) motor1_error_sum =  motor_error_sum_max;
+    if (motor1_error_sum < -motor_error_sum_max) motor1_error_sum = -motor_error_sum_max;
+    int motor1_real_pwm = (int)( motor_kf * motor1_ticks_per_interval + motor_kp * motor1_error + motor_ki * motor1_error_sum );
 //    int motor1_real_pwm = ( motor1_error / 10 ) + ( motor1_error_sum / 10 ) + ( motor1_error - motor1_error_old );
     motor1_error_old = motor1_error;
 
 /* limit max PWM change */
-    if (( motor1_real_pwm - motor1_pwm_old ) > MOTOR_PWM_MAX_DIFF )  motor1_real_pwm = motor1_pwm_old + MOTOR_PWM_MAX_DIFF;
-    if (( motor1_real_pwm - motor1_pwm_old ) < -MOTOR_PWM_MAX_DIFF ) motor1_real_pwm = motor1_pwm_old - MOTOR_PWM_MAX_DIFF;
+    if (( motor1_real_pwm - motor1_pwm_old ) > motor_pwm_max_diff )  motor1_real_pwm = motor1_pwm_old + motor_pwm_max_diff;
+    if (( motor1_real_pwm - motor1_pwm_old ) < -motor_pwm_max_diff ) motor1_real_pwm = motor1_pwm_old - motor_pwm_max_diff;
 
     if ( motor1_real_pwm >  MOTOR_PWM_MAX ) motor1_error_sum = motor1_error_sum - motor1_error;
     if ( motor1_real_pwm < -MOTOR_PWM_MAX ) motor1_error_sum = motor1_error_sum - motor1_error;
